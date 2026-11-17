@@ -3,7 +3,7 @@ import json
 import time
 import uuid
 import streamlit as st
-from agent_engine import API_MODEL, Store, build_graph, load_env
+from agent_engine import API_MODEL, Store, answer_confirmation, build_graph, load_env, run_request
 
 load_env()
 
@@ -46,8 +46,8 @@ def graph():
     return build_graph()
 
 with st.expander("Flujo de trabajo"):
-    st.graphviz_chart('digraph { rankdir=TB; inicio -> planificar; inicio -> validar [label="confirmación"]; planificar -> validar; validar -> ejecutar [label="plan permitido"]; validar -> responder [label="rechazo o pendiente"]; ejecutar -> responder; responder -> fin; }')
-    st.caption("Un máximo de una herramienta por petición. Confirmar reutiliza el plan revisado.")
+    st.graphviz_chart('digraph { rankdir=TB; inicio -> planificar; planificar -> validar; validar -> ejecutar [label="plan permitido"]; validar -> confirmar [label="incidencia"]; validar -> responder [label="rechazo"]; confirmar -> ejecutar [label="sí"]; confirmar -> responder [label="no"]; ejecutar -> responder; responder -> fin; }')
+    st.caption("Un máximo de una herramienta por petición. En confirmar el grafo se detiene y guarda su estado hasta que respondes.")
 
 with st.form("request"):
     question = st.text_area("¿Qué necesitas?", max_chars=1500)
@@ -60,11 +60,11 @@ if submit:
         try:
             with st.spinner("Recorriendo el flujo del agente..."):
                 start = time.perf_counter()
-                state = graph().invoke({
+                state = run_request(graph(), {
                     "question": question.strip(), "request_id": uuid.uuid4().hex,
                     "model": model, "mode": mode, "approved": False,
                     "trace": [], "status": "new",
-                }, config={"recursion_limit": 12})
+                })
                 state["seconds"] = round(time.perf_counter() - start, 2)
                 st.session_state.last = state
         except Exception as error:
@@ -85,17 +85,18 @@ if state:
     if state["status"] == "needs_confirmation":
         st.warning("Confirmar guardará exactamente el título y la descripción mostrados en la base SQLite local.")
         confirm, cancel = st.columns(2)
-        if confirm.button("Confirmar registro de la incidencia"):
-            try:
-                resumed = {**state, "approved": True, "status": "planned", "error": ""}
-                st.session_state.last = graph().invoke(resumed, config={"recursion_limit": 12})
-                st.rerun()
-            except Exception as error:
-                st.error(f"No se pudo confirmar: {error}")
+        approved = True if confirm.button("Confirmar registro de la incidencia") else None
         if cancel.button("Cancelar incidencia"):
-            st.session_state.last = {**state, "status": "cancelled",
-                "response": "Incidencia cancelada. No se ha registrado."}
-            st.rerun()
+            approved = False
+        if approved is not None:
+            try:
+                st.session_state.last = answer_confirmation(graph(), state["request_id"], approved)
+                st.rerun()
+            except LookupError as error:
+                st.session_state.pop("last", None)
+                st.error(str(error))
+            except Exception as error:
+                st.error(f"No se pudo responder a la confirmación: {error}")
     if state.get("result") is not None:
         result = state["result"]
         if state["plan"]["tool"] == "stock":

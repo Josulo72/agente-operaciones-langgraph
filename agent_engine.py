@@ -278,7 +278,7 @@ def make_nodes(store_factory=Store, planner=None):
         if status == "error":
             text = state.get("error", "La operación no se completó.")
         elif status == "needs_confirmation":
-            text = "Incidencia preparada. Revisa el contenido y confirma para registrarla."
+            text = PENDING
         elif status == "unsupported":
             text = state["plan"]["arguments"]["reason"]
         elif status == "cancelled":
@@ -296,18 +296,64 @@ def make_nodes(store_factory=Store, planner=None):
         return {"response": text, "trace": event(state, "responder", start)}
     return {"planificar": plan, "validar": validate, "ejecutar": execute, "responder": finish}
 
-def build_graph(store_factory=Store, planner=None):
+PENDING = "Incidencia preparada. Revisa el contenido y confirma para registrarla."
+
+def build_graph(store_factory=Store, planner=None, checkpointer=None):
+    from langgraph.checkpoint.memory import InMemorySaver
     from langgraph.graph import END, START, StateGraph
+    from langgraph.types import interrupt
+
+    def confirm(state):
+        # interrupt() detiene el grafo aqui y guarda el estado en el checkpointer.
+        # Al reanudar, el nodo se ejecuta otra vez desde el principio y interrupt()
+        # devuelve la respuesta del usuario, por eso no se escribe nada antes de esta linea.
+        answer = interrupt({"plan": state["plan"]})
+        start = time.perf_counter()
+        if answer is True:
+            return {"approved": True, "status": "ready",
+                    "trace": event(state, "confirmar", start, respuesta="confirmada")}
+        return {"approved": False, "status": "cancelled",
+                "trace": event(state, "confirmar", start, respuesta="cancelada")}
+
+    def after_validation(state):
+        if state["status"] == "ready":
+            return "ejecutar"
+        return "confirmar" if state["status"] == "needs_confirmation" else "responder"
+
     nodes = make_nodes(store_factory, planner)
     graph = StateGraph(State)
     for name, fn in nodes.items():
         graph.add_node(name, fn)
-    graph.add_conditional_edges(START, lambda state: "validar" if state.get("plan") else "planificar",
-                                {"validar": "validar", "planificar": "planificar"})
+    graph.add_node("confirmar", confirm)
+    graph.add_edge(START, "planificar")
     graph.add_edge("planificar", "validar")
-    graph.add_conditional_edges("validar",
+    graph.add_conditional_edges("validar", after_validation,
+        {"ejecutar": "ejecutar", "confirmar": "confirmar", "responder": "responder"})
+    graph.add_conditional_edges("confirmar",
         lambda state: "ejecutar" if state["status"] == "ready" else "responder",
         {"ejecutar": "ejecutar", "responder": "responder"})
     graph.add_edge("ejecutar", "responder")
     graph.add_edge("responder", END)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer or InMemorySaver())
+
+def thread_config(request_id):
+    return {"configurable": {"thread_id": request_id}, "recursion_limit": 12}
+
+def snapshot(output):
+    """Estado apto para la interfaz y para JSON: sin los objetos internos de la pausa."""
+    state = {key: value for key, value in output.items() if key != "__interrupt__"}
+    if "__interrupt__" in output:
+        state["response"] = PENDING
+    return state
+
+def run_request(graph, state):
+    """Lanza una peticion nueva en su propio hilo. Si es una incidencia, vuelve en pausa."""
+    return snapshot(graph.invoke(state, thread_config(state["request_id"])))
+
+def answer_confirmation(graph, request_id, approved):
+    """Reanuda la peticion que esta esperando confirmacion con la respuesta del usuario."""
+    from langgraph.types import Command
+    config = thread_config(request_id)
+    if graph.get_state(config).next != ("confirmar",):
+        raise LookupError("Esta incidencia ya no está pendiente de confirmación. Vuelve a enviar la petición.")
+    return snapshot(graph.invoke(Command(resume=approved is True), config))

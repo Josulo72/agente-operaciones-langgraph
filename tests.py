@@ -8,7 +8,9 @@ import requests
 from pathlib import Path
 from unittest import mock
 from agent_engine import (Store, calculate, validate_plan, demo_plan, make_nodes, build_graph,
-                          api_plan, load_env)
+                          api_plan, load_env, run_request, answer_confirmation, PENDING)
+
+HAS_LANGGRAPH=importlib.util.find_spec("langgraph") is not None
 
 class AgentTests(unittest.TestCase):
     def setUp(self):
@@ -162,17 +164,71 @@ class AgentTests(unittest.TestCase):
                 self.assertEqual(os.environ["PRUEBA_NUEVA"],"uno")
                 self.assertEqual(os.environ["PRUEBA_PUESTA"],"original")
             load_env(Path(folder)/"no-existe")
-    @unittest.skipUnless(importlib.util.find_spec("langgraph") is not None,"LangGraph no instalado")
-    def test_real_langgraph_routes_and_confirmation(self):
-        graph=build_graph(lambda: Store(connection=self.db),planner=demo_plan)
-        pending=graph.invoke(self.state("incidencia: Impresora | No imprime"))
+
+@unittest.skipUnless(HAS_LANGGRAPH,"LangGraph no instalado")
+class GraphTests(unittest.TestCase):
+    """El grafo compilado de verdad: pausa con interrupt(), reanudacion y cancelacion."""
+    def setUp(self):
+        self.db=sqlite3.connect(":memory:")
+        self.store=Store(connection=self.db)
+        self.graph=build_graph(lambda: Store(connection=self.db),planner=demo_plan)
+    def tearDown(self):
+        self.db.close()
+    def state(self,question,request_id="peticion-1"):
+        return {"question":question,"request_id":request_id,"mode":"demo",
+                "model":"unused","approved":False,"status":"new","trace":[]}
+    def nodes(self,state):
+        return [e["nodo"] for e in state["trace"]]
+    def test_ticket_pauses_before_writing(self):
+        pending=run_request(self.graph,self.state("incidencia: Impresora | No imprime"))
         self.assertEqual(pending["status"],"needs_confirmation")
+        self.assertEqual(pending["response"],PENDING)
+        self.assertEqual(self.nodes(pending),["planificar","validar"])
+        self.assertNotIn("__interrupt__",pending)
         self.assertEqual(self.store.tickets(),[])
-        done=graph.invoke({**pending,"approved":True,"status":"planned"})
+    def test_confirm_resumes_and_writes_once(self):
+        pending=run_request(self.graph,self.state("incidencia: Impresora | No imprime"))
+        done=answer_confirmation(self.graph,pending["request_id"],True)
         self.assertEqual(done["status"],"done")
-        repeated=graph.invoke({**pending,"approved":True,"status":"planned"})
-        self.assertEqual(repeated["result"]["id"],done["result"]["id"])
+        self.assertEqual(self.nodes(done),["planificar","validar","confirmar","ejecutar","responder"])
+        self.assertEqual(done["plan"],pending["plan"])
         self.assertEqual(len(self.store.tickets()),1)
+        with self.assertRaises(LookupError): answer_confirmation(self.graph,pending["request_id"],True)
+        self.assertEqual(len(self.store.tickets()),1)
+    def test_cancel_writes_nothing(self):
+        pending=run_request(self.graph,self.state("incidencia: Impresora | No imprime"))
+        cancelled=answer_confirmation(self.graph,pending["request_id"],False)
+        self.assertEqual(cancelled["status"],"cancelled")
+        self.assertEqual(self.nodes(cancelled),["planificar","validar","confirmar","responder"])
+        self.assertEqual(self.store.tickets(),[])
+    def test_only_true_confirms(self):
+        pending=run_request(self.graph,self.state("incidencia: Impresora | No imprime"))
+        result=answer_confirmation(self.graph,pending["request_id"],"si")
+        self.assertEqual(result["status"],"cancelled")
+        self.assertEqual(self.store.tickets(),[])
+    def test_unknown_request_cannot_be_confirmed(self):
+        with self.assertRaises(LookupError): answer_confirmation(self.graph,"no-existe",True)
+        self.assertEqual(self.store.tickets(),[])
+    def test_requests_wait_independently(self):
+        first=run_request(self.graph,self.state("incidencia: Impresora | No imprime","a"))
+        second=run_request(self.graph,self.state("incidencia: Proyector | No enciende","b"))
+        answer_confirmation(self.graph,second["request_id"],True)
+        self.assertEqual([t["title"] for t in self.store.tickets()],["Proyector"])
+        answer_confirmation(self.graph,first["request_id"],True)
+        self.assertEqual(len(self.store.tickets()),2)
+    def test_other_tools_do_not_pause(self):
+        done=run_request(self.graph,self.state("calcula 12*3"))
+        self.assertEqual(done["result"]["value"],36)
+        self.assertEqual(self.nodes(done),["planificar","validar","ejecutar","responder"])
+    def test_rejected_request_does_not_pause(self):
+        done=run_request(self.graph,self.state("Envia un correo"))
+        self.assertEqual(done["status"],"unsupported")
+        self.assertEqual(self.nodes(done),["planificar","validar","responder"])
+    def test_state_is_json_serializable(self):
+        import json
+        pending=run_request(self.graph,self.state("incidencia: Impresora | No imprime"))
+        json.dumps(pending)
+        json.dumps(answer_confirmation(self.graph,pending["request_id"],True))
 
 if __name__=="__main__":
     unittest.main(verbosity=2)
